@@ -22,9 +22,12 @@ class Store:
             PRIMARY KEY(scope, user_id));
         CREATE TABLE IF NOT EXISTS samples (
             id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, user_id TEXT NOT NULL,
-            message_id TEXT, text TEXT NOT NULL,
+            message_id TEXT, text TEXT NOT NULL, sent_at REAL NOT NULL DEFAULT 0,
             UNIQUE(scope, message_id));
         CREATE INDEX IF NOT EXISTS samples_member ON samples(scope, user_id, id);
+        CREATE TABLE IF NOT EXISTS message_ids (
+            scope TEXT NOT NULL, message_id TEXT NOT NULL, user_id TEXT NOT NULL,
+            PRIMARY KEY(scope, message_id));
         CREATE TABLE IF NOT EXISTS shared_profiles (
             profile_key TEXT NOT NULL, user_id TEXT NOT NULL, source_scopes TEXT NOT NULL,
             prompt TEXT NOT NULL DEFAULT '', generated_at_count INTEGER NOT NULL DEFAULT 0,
@@ -44,8 +47,17 @@ class Store:
         CREATE INDEX IF NOT EXISTS turns_session ON turns(session_id, id);
         CREATE TABLE IF NOT EXISTS notes (
             id TEXT PRIMARY KEY, origin TEXT NOT NULL, cid TEXT NOT NULL, text TEXT NOT NULL);
-        PRAGMA user_version=2;
         """)
+        with self.db:
+            if "sent_at" not in {row[1] for row in self.db.execute("PRAGMA table_info(samples)")}:
+                self.db.execute("ALTER TABLE samples ADD COLUMN sent_at REAL NOT NULL DEFAULT 0")
+                # Legacy samples have no source time; keep their relative insertion order.
+                self.db.execute("UPDATE samples SET sent_at=?", (time.time(),))
+            self.db.execute(
+                """INSERT OR IGNORE INTO message_ids(scope,message_id,user_id)
+                SELECT scope,message_id,user_id FROM samples WHERE message_id IS NOT NULL"""
+            )
+            self.db.execute("PRAGMA user_version=3")
 
     def close(self):
         self.db.close()
@@ -60,11 +72,23 @@ class Store:
             for r in self.db.execute("SELECT * FROM members WHERE scope=? ORDER BY total DESC, user_id", (scope,))
         ]
 
-    def collect(self, scope, user, name, message_id, text, max_samples):
+    def collect(self, scope, user, name, message_id, text, max_samples, timestamp=None, history_id=None):
         with self.db:
+            identifiers = {message_id} if message_id else set()
+            if history_id is not None:
+                identifiers.add(f"astrbot_history:{history_id}")
+            duplicate = False
+            for identifier in identifiers:
+                if not self.db.execute(
+                    "INSERT OR IGNORE INTO message_ids(scope,message_id,user_id) VALUES(?,?,?)",
+                    (scope, identifier, user),
+                ).rowcount:
+                    duplicate = True
+            if duplicate:
+                return False
             inserted = self.db.execute(
-                "INSERT OR IGNORE INTO samples(scope,user_id,message_id,text) VALUES(?,?,?,?)",
-                (scope, user, message_id or None, text),
+                "INSERT OR IGNORE INTO samples(scope,user_id,message_id,text,sent_at) VALUES(?,?,?,?,?)",
+                (scope, user, message_id or None, text, time.time() if timestamp is None else timestamp),
             ).rowcount
             if not inserted:
                 return False
@@ -75,7 +99,7 @@ class Store:
             )
             self.db.execute(
                 """DELETE FROM samples WHERE scope=? AND user_id=? AND id NOT IN
-                (SELECT id FROM samples WHERE scope=? AND user_id=? ORDER BY id DESC LIMIT ?)""",
+                (SELECT id FROM samples WHERE scope=? AND user_id=? ORDER BY sent_at DESC,id DESC LIMIT ?)""",
                 (scope, user, scope, user, max_samples),
             )
         return True
@@ -83,7 +107,9 @@ class Store:
     def samples(self, scope, user):
         return [
             r[0]
-            for r in self.db.execute("SELECT text FROM samples WHERE scope=? AND user_id=? ORDER BY id", (scope, user))
+            for r in self.db.execute(
+                "SELECT text FROM samples WHERE scope=? AND user_id=? ORDER BY sent_at,id", (scope, user)
+            )
         ]
 
     def total_messages(self, scopes, user):
@@ -237,6 +263,7 @@ class Store:
                 self.db.execute("DELETE FROM sessions WHERE id=?", (sid,))
             self.db.execute("DELETE FROM selections WHERE scope=? AND (owner=? OR target=?)", (scope, user, user))
             self.db.execute("DELETE FROM samples WHERE scope=? AND user_id=?", (scope, user))
+            self.db.execute("DELETE FROM message_ids WHERE scope=? AND user_id=?", (scope, user))
             self.db.execute("DELETE FROM members WHERE scope=? AND user_id=?", (scope, user))
         return shared_keys
 

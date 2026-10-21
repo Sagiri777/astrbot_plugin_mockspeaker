@@ -1,7 +1,7 @@
 name: astrbot_plugin_mockspeaker
 display_name: 群友发言模仿
-desc: 采集指定群的发言并生成群友人格，支持可选跨群语料合并、独立选择模仿对象、自动更新、工具调用和上下文摘要隔离。
-version: v1.1.0
+desc: 采集指定群的发言并生成群友人格，支持历史消息导入、可选跨群语料合并、独立选择模仿对象、自动更新、工具调用和上下文摘要隔离。
+version: v1.2.0
 author: Sagiri777
 repo: https://github.com/Sagiri777/astrbot_plugin_mockspeaker
 astrbot_version: ">=4.29.1,<5"

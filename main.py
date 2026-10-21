@@ -9,6 +9,7 @@ from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, StarTools
 
 from .mockspeaker.config import Settings
+from .mockspeaker.history import fetch_history, fetch_saved_history, history_source, message_time, plain_text
 from .mockspeaker.prompts import mimic_system
 from .mockspeaker.service import MockSpeakerService
 from .mockspeaker.store import Store, scope_key
@@ -20,8 +21,9 @@ HELP = """群友发言模仿（仅限配置中启用的群）
 /模仿 状态 [用户ID]：查看自己选择或某群友的采集进度
 /模仿 提示词 用户ID：查看生成的人格
 /模仿 生成 用户ID：管理员手动生成/更新
+/模仿 导入 [条数] [用户ID]：管理员导入本群历史，可用 @限定群友
 /模仿 删除 [用户ID]：删除本人数据；管理员可删除他人数据
-英文：/mockspeaker list|start|stop|status|prompt|generate|forget
+英文：/mockspeaker list|start|stop|status|prompt|generate|import|forget
 每人的选择独立。只在机器人本来会回复你的消息时模仿。"""
 
 
@@ -31,6 +33,7 @@ class MockSpeakerPlugin(Star):
         self.settings = Settings.from_config(config)
         self.store = Store(StarTools.get_data_dir("astrbot_plugin_mockspeaker") / "mockspeaker.sqlite3")
         self.service = MockSpeakerService(self.store, self.settings, self._generate, self._sync_persona)
+        self.history_imports = set()
 
     def _scope(self, event):
         return scope_key(str(event.get_platform_id()), str(event.get_group_id()))
@@ -77,15 +80,12 @@ class MockSpeakerPlugin(Star):
         if not self._enabled(event):
             return
         user = str(event.get_sender_id())
-        if user == str(event.get_self_id()) or user in self.settings.excluded_users:
-            return
-        text = "".join(part.text for part in event.get_messages() if isinstance(part, Plain)).strip()
-        if len(text) < self.settings.min_message_chars or any(
-            text.startswith(p) for p in self.settings.command_prefixes
-        ):
-            return
-        # Never learn the plugin's own command arguments when wake prefixes omit '/'.
-        if text.lstrip("/").startswith(("模仿", "mockspeaker")):
+        text = self._sample_text(
+            user,
+            str(event.get_self_id()),
+            "".join(part.text for part in event.get_messages() if isinstance(part, Plain)),
+        )
+        if not text:
             return
         scope = self._scope(event)
         self.store.collect(
@@ -93,10 +93,25 @@ class MockSpeakerPlugin(Star):
             user,
             str(event.get_sender_name()),
             str(event.message_obj.message_id or ""),
-            text[: self.settings.max_message_chars],
+            text,
             self.settings.max_samples,
+            timestamp=getattr(event.message_obj, "timestamp", None),
+            history_id=event.get_extra("_current_platform_message_history_id"),
         )
         self.service.schedule_profile(scope, user, event.unified_msg_origin)
+
+    def _sample_text(self, user, self_id, text):
+        if not user or user == self_id or user in self.settings.excluded_users:
+            return ""
+        text = text.strip()
+        if len(text) < self.settings.min_message_chars or any(
+            text.startswith(p) for p in self.settings.command_prefixes
+        ):
+            return ""
+        # Never learn the plugin's own command arguments when wake prefixes omit '/'.
+        if text.lstrip("/").startswith(("模仿", "mockspeaker")):
+            return ""
+        return text[: self.settings.max_message_chars]
 
     @filter.command_group("模仿", alias={"mockspeaker"})
     async def mimic(self, event: AstrMessageEvent):
@@ -223,6 +238,70 @@ class MockSpeakerPlugin(Star):
             yield event.plain_result("已提交人格生成任务，可用 /模仿 状态 用户ID 查看结果。")
         except ValueError as exc:
             yield event.plain_result(str(exc))
+
+    @mimic.command("导入", alias={"import"})
+    async def import_command(self, event: AstrMessageEvent, count: int = 1000, target: str = ""):
+        try:
+            self._require_group(event)
+            if not event.is_admin():
+                raise ValueError("此操作需要 AstrBot 管理员权限。")
+            if not 1 <= count <= 10000:
+                raise ValueError("历史读取条数必须在 1 到 10000 之间。")
+            if target or any(
+                isinstance(part, At) and str(part.qq) not in (str(event.get_self_id()), "all", "0")
+                for part in event.get_messages()
+            ):
+                target = self._target(event, target)
+            if target in self.settings.excluded_users:
+                raise ValueError("该用户已被排除采集。")
+            source = history_source(event, self.context)
+            scope = self._scope(event)
+            if scope in self.history_imports:
+                raise ValueError("本群已有历史导入正在进行，请稍后查看结果。")
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+            return
+        self.history_imports.add(scope)
+        try:
+            label = "OneBot 群历史" if source == "onebot" else "AstrBot 本地群历史"
+            yield event.plain_result(f"正在读取本群最近最多 {count} 条历史消息（{label}），请稍候。")
+            if source == "onebot":
+                messages, notice = await fetch_history(event, count, self.settings.timeout)
+            else:
+                messages, notice = await fetch_saved_history(self.context, event, count, self.settings.timeout)
+            users, added = set(), 0
+            for message in messages:
+                if str(message.get("group_id", event.get_group_id())) != str(event.get_group_id()):
+                    continue
+                sender = message.get("sender")
+                if not isinstance(sender, dict):
+                    continue
+                user = str(sender.get("user_id") or message.get("user_id") or "")
+                if target and user != target:
+                    continue
+                text = self._sample_text(user, str(event.get_self_id()), plain_text(message.get("message")))
+                if not text:
+                    continue
+                if self.store.collect(
+                    scope,
+                    user,
+                    str(sender.get("card") or sender.get("nickname") or user),
+                    str(message["message_id"]),
+                    text,
+                    self.settings.max_samples,
+                    timestamp=message_time(message),
+                ):
+                    users.add(user)
+                    added += 1
+            scheduled = sum(self.service.schedule_profile(scope, user, event.unified_msg_origin) for user in users)
+            yield event.plain_result(
+                f"历史导入完成：读取 {len(messages)} 条，新增 {added} 条有效语料，涉及 {len(users)} 位群友；"
+                f"其余已过滤或去重。已提交 {scheduled} 个人格生成/更新任务。" + (" " + notice if notice else "")
+            )
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+        finally:
+            self.history_imports.discard(scope)
 
     @mimic.command("删除", alias={"forget"})
     async def forget_command(self, event: AstrMessageEvent, target: str = ""):

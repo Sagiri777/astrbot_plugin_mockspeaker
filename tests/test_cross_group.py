@@ -205,7 +205,7 @@ async def test_shared_profiles_survive_restart_and_database_upgrade(tmp_path):
     service = MockSpeakerService(store, settings(), persona)
     assert service.ready_profile(B, "bob")["generated_at_count"] == 2
     assert store.selected(A, "alice") == "bob"
-    assert store.db.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert store.db.execute("PRAGMA user_version").fetchone()[0] == 3
     store.close()
 
 

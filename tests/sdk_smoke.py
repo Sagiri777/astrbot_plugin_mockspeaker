@@ -12,13 +12,14 @@ import os
 import sys
 import tempfile
 import types
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 
 async def verify():
     import astrbot
-    from astrbot.api.event import AstrMessageEvent
+    from astrbot.api.event import AstrMessageEvent, MessageChain
     from astrbot.api.message_components import Plain
     from astrbot.api.provider import LLMResponse, ProviderRequest
     from astrbot.core import db_helper
@@ -32,6 +33,7 @@ async def verify():
     from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
     from astrbot.core.platform.message_type import MessageType
     from astrbot.core.platform.platform_metadata import PlatformMetadata
+    from astrbot.core.platform_message_history_mgr import PlatformMessageHistoryManager
     from astrbot.core.provider.register import llm_tools
 
     root = Path(__file__).resolve().parents[1]
@@ -45,13 +47,13 @@ async def verify():
     names = {tool.name for tool in llm_tools.func_list}
     assert {"mockspeaker_list", "mockspeaker_get_prompt", "mockspeaker_select", "mockspeaker_pause"} <= names
 
-    def event(group="100", sender="alice"):
+    def event(group="100", sender="alice", platform="qq1"):
         message = AstrBotMessage()
         message.type, message.self_id, message.group_id = MessageType.GROUP_MESSAGE, "bot", group
         message.sender = MessageMember(sender, sender.title())
         message.message, message.message_id = [Plain("周五见面")], "test-message"
         message.message_str = "周五见面"
-        return AstrMessageEvent(message.message_str, message, PlatformMetadata("test", "test", "qq1"), group)
+        return AstrMessageEvent(message.message_str, message, PlatformMetadata("test", "test", platform), group)
 
     await db_helper.initialize()
     cm = ConversationManager(db_helper)
@@ -61,7 +63,12 @@ async def verify():
     async def generate(**kwargs):
         return LLMResponse(role="assistant", completion_text="用户和AI约定周五19点见面。")
 
-    context = SimpleNamespace(conversation_manager=cm, persona_manager=personas, llm_generate=generate)
+    context = SimpleNamespace(
+        conversation_manager=cm,
+        persona_manager=personas,
+        llm_generate=generate,
+        message_history_manager=PlatformMessageHistoryManager(db_helper),
+    )
     plugin = module.MockSpeakerPlugin(context, {"allowed_groups": ["100"], "min_messages": 1, "provider_id": "fake"})
     try:
         first = event()
@@ -155,9 +162,66 @@ async def verify():
             pass
         else:
             raise AssertionError("Deleting a source group must remove the exported shared persona")
+
+        # Use the SDK's registered command filter, including default arguments and alias.
+        command = next(f for f in plugin.mimic.parent_group.sub_command_filters if f.command_name == "导入")
+        historical = event()
+        historical.role, historical.is_at_or_wake_command = "admin", True
+        historical.message_str = "模仿 导入"
+        assert command.filter(historical, {})
+        assert historical.get_extra("parsed_params") == {"count": 1000, "target": ""}
+        historical.message_str = "mockspeaker import 2 bob"
+        assert command.filter(historical, {})
+        assert historical.get_extra("parsed_params") == {"count": 2, "target": "bob"}
+
+        async def history_action(action, **params):
+            assert action == "get_group_msg_history" and params["group_id"] == 100
+            return {
+                "messages": [
+                    {
+                        "message_id": f"history-{i}",
+                        "time": i,
+                        "group_id": 100,
+                        "sender": {"user_id": "bob", "nickname": "Bob"},
+                        "message": [{"type": "text", "data": {"text": f"历史群聊发言{i}"}}],
+                    }
+                    for i in (1, 2)
+                ]
+            }
+
+        historical.bot = SimpleNamespace(api=SimpleNamespace(call_action=history_action))
+        replies = [r async for r in plugin.import_command(historical, **historical.get_extra("parsed_params"))]
+        assert "新增 2 条" in "".join(part.text for reply in replies for part in reply.chain if isinstance(part, Plain))
+        await asyncio.gather(*plugin.service.jobs.values())
+        assert plugin.service.ready_profile(scope, "bob")["generated_at_count"] == 3
+
+        # Official QQ uses nonnumeric OpenIDs and the core's saved platform history.
+        saved_event = event(group="group-openid", platform="official-instance")
+        saved_event.role = "admin"
+        plugin.settings = replace(plugin.settings, allowed_groups=(*plugin.settings.allowed_groups, "group-openid"))
+        plugin.service.settings = plugin.settings
+        first_row = None
+        for index, role in enumerate(("user", "user", "bot"), 1):
+            row = await context.message_history_manager.insert_message_chain(
+                platform_id=saved_event.get_platform_id(),
+                user_id=saved_event.unified_msg_origin,
+                message_chain=MessageChain([Plain(f"本地群聊发言{index}")]),
+                role=role,
+                sender_id="member-openid",
+                sender_name="群友",
+            )
+            first_row = first_row or row
+        live = event(group="group-openid", sender="member-openid", platform="official-instance")
+        live.set_extra("_current_platform_message_history_id", first_row.id)
+        await plugin.collect_messages(live)
+        replies = [r async for r in plugin.import_command(saved_event)]
+        saved_reply = "".join(part.text for reply in replies for part in reply.chain if isinstance(part, Plain))
+        assert "AstrBot 本地群历史" in saved_reply and "读取 3 条，新增 1 条" in saved_reply
+        await asyncio.gather(*plugin.service.jobs.values())
+        assert plugin.service.ready_profile(plugin._scope(saved_event), "member-openid")["generated_at_count"] == 2
         print(
             f"AstrBot {astrbot.__version__}: registration, persona sync, runner assembly, history isolation, "
-            "summary restoration and cross-group profiles passed"
+            "summary restoration, cross-group profiles, OneBot and saved group history import passed"
         )
     finally:
         await plugin.terminate()
