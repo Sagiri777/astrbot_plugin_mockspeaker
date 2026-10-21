@@ -1,14 +1,142 @@
-# astrbot-plugin-helloworld
+# MockSpeaker · 群友发言模仿
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+为指定群聊的群友建立发言风格人格。每个群友可以为 AI 选择不同的模仿对象，随时暂停并恢复原人格；模仿原文与原会话分开保存，通过事实摘要衔接聊天内容。
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+## 功能
 
-# Supports
+- 按群白名单采集群内文字消息，按群、用户分别累计有效消息数。
+- 达到下限自动生成群友人格；目标每新增指定条数的有效消息，自动更新人格。
+- 每位发言者独立选择模仿对象，选择持久化，群聊和平台实例之间隔离。
+- 模仿请求替换原人格和预设对话，使用独立的近期历史与事实记忆。
+- 暂停或切换时提取剩余交流要点。恢复原人格后只回填中性摘要，保留话题连续性。
+- 提供 AI 工具：列出可用群友、读取提示词、选择对象、暂停模仿。
+- 可选同步到 AstrBot 人格库；支持查看提示词、手动更新和删除数据。
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+## 安装与配置
+
+使用 **AstrBot 4.29.1 或更高的 4.x 版本**，配合内置本地 Agent 聊天流水线。插件本身只使用 Python 标准库，不需要额外运行时依赖。
+
+将整个目录放到 AstrBot 的 `data/plugins/astrbot_plugin_mockspeaker/`，或在插件管理页上传安装 ZIP。加载插件后，在插件配置页设置：
+
+```json
+{
+  "allowed_groups": ["123456789"],
+  "min_messages": 100,
+  "update_every": 50,
+  "provider_id": "",
+  "sync_personas": false
+}
+```
+
+`allowed_groups` **默认空列表，表示全部关闭**。群号填字符串；多机器人实例可填写 `平台实例ID:群号`，例如 `qq_main:123456789`。平台实例ID是 AstrBot 消息平台配置的唯一 ID，不是适配器类型名。
+
+`provider_id` 留空时，人格和摘要模型跟随消息所属会话的聊天模型；也可以指定已配置的模型提供商 ID。正常聊天仍使用 AstrBot 为该会话选择的聊天模型。
+
+保存配置并重载插件后，开始采集后续消息。不会自动获取安装前的群历史。将 `min_messages` 临时设为较小值，可先在测试群验证流程。
+
+## 群内命令
+
+以下示例采用默认 `/` 唤醒前缀；若 AstrBot 修改过前缀，请相应调整。群聊本身的机器人唤醒、白名单和权限配置仍需正常启用。
+
+| 命令 | 用途 |
+| --- | --- |
+| `/模仿` 或 `/模仿 帮助` | 查看帮助 |
+| `/模仿 列表 [页码]` | 查看有效消息数和可用人格，每页20人 |
+| `/模仿 开始 目标用户ID` | 为自己选择模仿对象，也支持 @目标群友 |
+| `/模仿 暂停` | 暂停自己的模仿并恢复原人格 |
+| `/模仿 状态` | 查看自己的选择 |
+| `/模仿 状态 目标用户ID` | 查看采集、生成进度和失败状态 |
+| `/模仿 提示词 目标用户ID` | 查看生成的人格提示词 |
+| `/模仿 生成 目标用户ID` | 手动生成或更新，需 AstrBot 管理员权限，仍须达到下限 |
+| `/模仿 删除` | 删除自己在本群的采集和相关隔离记录 |
+| `/模仿 删除 目标用户ID` | 删除指定用户数据，需 AstrBot 管理员权限 |
+
+英文等价命令为 `/mockspeaker help|list|start|stop|status|prompt|generate|forget`。
+
+例如，甲执行 `/模仿 开始 乙的ID`，丙执行 `/模仿 开始 丁的ID`，则 AI 回复甲时模仿乙，回复丙时模仿丁。其他群友按各自选择工作。未开启模仿的群友使用原人格。
+
+开始和暂停从**下一条触发 AI 的消息**生效；已经在生成中的回复会完成，并按原来的隔离会话归档。插件不会让机器人自动回复每条群消息，仍遵循 AstrBot 的 @、唤醒词和聊天触发规则。
+
+## AI 工具
+
+在 AstrBot 中启用相应插件工具，并使用支持工具调用的聊天模型：
+
+| 工具 | 参数 | 行为 |
+| --- | --- | --- |
+| `mockspeaker_list` | 无 | 列出当前群达到门槛且已生成人格的用户 |
+| `mockspeaker_get_prompt` | `target_id: string` | 读取当前群目标的人格提示词，不改变持久选择 |
+| `mockspeaker_select` | `target_id: string` | 为当前消息发言者设置持续模仿对象，下一条消息起生效 |
+| `mockspeaker_pause` | 无 | 暂停当前发言者的模仿，下一条消息恢复原人格 |
+
+可向 AI 说“列出能模仿的群友”“之后模仿用户123456”“停止模仿”。工具描述要求只有用户明确提出时才改变选择。工具无法传入其他发言者 ID 来修改他人的选择。
+
+读取提示词属于查询；若希望后续对话完整替换人格，应选择 `mockspeaker_select`。读取、选择、暂停工具的这一轮也会隔离保存，防止人格规则及持续模仿指令留在原会话历史中。选择、暂停工具的当前回复只确认操作，下一条消息才使用新的状态。
+
+## 上下文处理
+
+```mermaid
+flowchart TD
+    A[原会话与原人格] -->|开始模仿，提取事实| B[独立模仿会话]
+    B --> C[目标群友人格 + 独立近期历史]
+    C --> D[中性摘要：话题、事实、决定、待办]
+    D -->|原会话下次请求时回填| A
+    C -->|暂停| E[下一条消息恢复原人格]
+```
+
+模仿请求清空 AstrBot 已加载的原人格提示词和预设对话，换成目标人格与插件管理的历史；取消该请求与原会话的保存绑定，因此核心历史保存器不会把模仿原文写入原会话。插件不修改原会话的 `persona_id`，暂停后按 AstrBot 当前的人格配置继续聊天。
+
+默认每6轮提取一次事实要点，暂停或切换时提前处理余下记录。摘要要求删除口头禅、人设指令、语气词和原文引用，区分用户陈述、AI 建议与虚构内容。摘要质量取决于所用模型，结构隔离不等于能保证模型的每次摘要都完全准确。
+
+要点绑定原会话 ID，通过可重试的待回填队列，在该原会话下次模型请求前写入历史。写入成功后才确认消费，并用唯一标记避免重复。摘要失败时不将原文降级写回；先恢复原人格，保留未处理记录，后续请求再重试，因此模型故障期间可能暂时缺少模仿交流的要点。
+
+使用 `/new` 等操作新建对话后，会为新的对话建立独立模仿记录；旧对话的摘要留在旧对话，不注入新对话。群聊采用共享原会话时，回填的事实要点也随该共享会话可见；模仿的原文历史与选择仍按发言者独立保存。
+
+## 配置项
+
+| 配置 | 默认值 | 说明 |
+| --- | --- | --- |
+| `allowed_groups` | `[]` | 群白名单，空列表为关闭 |
+| `min_messages` | `100` | 首次生成人格下限，1–1000000 |
+| `update_every` | `50` | 上次成功生成后每新增多少条消息更新，1–1000000 |
+| `max_samples` | `300` | 每群每用户保留的最近语料数，10–1000 |
+| `max_message_chars` | `500` | 每条语料保留的字符数，20–2000 |
+| `analysis_chars` | `40000` | 每次分析的语料字符预算，2000–200000，优先最近的完整消息 |
+| `min_message_chars` | `2` | 有效文字的最短长度，1–100 |
+| `provider_id` | `""` | 人格和摘要模型提供商，空值跟随当前会话 |
+| `summary_every` | `6` | 每隔多少轮摘要，1–20，不能大于 `context_turns` |
+| `context_turns` | `20` | 携带的最近完整模仿对话轮数，2–50；更早内容用摘要衔接 |
+| `summary_chars` | `1600` | 每批事实摘要及累计事实记忆的字符上限，200–4000 |
+| `timeout` | `90` | 单次人格或摘要模型调用超时秒数，5–300 |
+| `sync_personas` | `false` | 将生成人格同步到 AstrBot 人格库 |
+| `excluded_users` | `[]` | 不采集且不允许模仿的用户ID，适用于所有启用群 |
+| `command_prefixes` | `["/"]` | 不作为语料的命令前缀；插件自身命令始终排除 |
+
+只采集真人的顶层 `Plain` 文字组件；图片、语音、转发、引用内容和机器人自己的消息不计入。按平台消息 ID 对保留窗口内的消息去重，不承诺对已滚动清理的旧消息重放去重。累计条数独立于语料窗口，旧语料清理不会重置计数。
+
+例如下限100、更新间隔50，成功生成的计数依次为100、150、200……模型生成期间新增的消息不算作本次已分析消息，达到下一间隔后继续更新。生成失败保留旧人格，五分钟后收到新消息时重试；管理员可手动重试。后台人格生成最多并发2个，不占用摘要的并发名额。
+
+启用 `sync_personas` 后，人格库中会出现稳定的 `mockspeaker_` 前缀 ID。后续更新会覆盖该条人格，插件仍按请求应用人格，不需要把整群切到该人格。若刚开启同步，可用手动生成命令同步已有目标。为保留上下文隔离，请通过本插件选择对象；手动把导出人格设成群默认人格走的是 AstrBot 的普通聊天流程。
+
+## 数据与成本
+
+数据库位于 AstrBot 的 `data/plugin_data/astrbot_plugin_mockspeaker/mockspeaker.sqlite3`。其中保存语料、累计数、人格、个人选择、模仿会话和待回填摘要。重载和重启不会清空数据。备份运行中的数据库时需同时考虑 SQLite 的 WAL 文件。
+
+删除命令清除目标在本群的语料、人格、作为发言者或模仿对象的隔离记录、待回填要点及相关选择；已写入 AstrBot 原会话的摘要不回溯删除。若启用了人格同步，也会删除对应的导出人格。后续消息会重新采集；若需要停止采集，应把用户ID加入 `excluded_users` 后重载插件。
+
+人格分析会将选中的语料发送给配置的模型；摘要会发送相关交流记录。除正常聊天外，首次生成人格、增量更新、新模仿会话的原话题摘要及定期事实压缩都会增加模型调用；有累计记忆时，一批压缩通常使用两次调用。摘要服务故障期间，未处理的隔离记录会保留到成功处理或主动删除。
+
+## 开发与验证
+
+```bash
+uv venv --python 3.12
+uv pip install pytest pytest-asyncio ruff pyyaml
+uv run --no-project python -m pytest -q
+uv run --no-project ruff check .
+uv run --no-project ruff format --check .
+```
+
+自动化测试使用模型与 AstrBot API 替身，验证采集阈值、更新水位、生成并发、故障重试、持久化、多人隔离、原人格恢复、摘要回填幂等、会话重置、工具隔离和数据删除。正式使用前，需在自己的群适配器和真实模型上验证模仿效果。
+
+另提供真实 SDK 集成检查，在装有 AstrBot 依赖的 Python 环境中运行 `ASTRBOT_SOURCE=/path/to/AstrBot python tests/sdk_smoke.py`。它在临时运行目录中检查真实工具注册、人格创建更新、Agent 请求组装和核心历史保存器，模型调用使用固定回复，不连接消息平台。
+
+插件接入点基于 AstrBot 4.29.1 的 `on_llm_request` / `on_llm_response` 与内置历史保存流程。外部托管会话的第三方 Agent runner 不属于支持范围。其他插件若在更低优先级覆盖系统提示词，或另行记录、注入模仿原文，也需要协调其上下文处理。

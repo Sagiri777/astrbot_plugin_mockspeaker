@@ -205,3 +205,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# MockSpeaker local development and runtime data
+.DS_Store
+.ruff_cache/
+.venv/
+*.sqlite3*
+dist/

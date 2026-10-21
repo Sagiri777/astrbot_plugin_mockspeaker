@@ -1,0 +1,17 @@
+{
+  "allowed_groups": {"description": "启用采集和模仿的群聊", "type": "list", "default": [], "hint": "填写群号字符串，例如 123456；也可填写 平台实例ID:群号 精确限定机器人实例。空列表表示全部关闭，不代表所有群。"},
+  "min_messages": {"description": "首次生成人格的有效消息下限", "type": "int", "default": 100, "hint": "按群、按用户分别累计，范围 1–1000000；只统计安装启用后的有效文字消息。"},
+  "update_every": {"description": "每新增多少条目标消息更新人格", "type": "int", "default": 50, "hint": "从上次成功生成时的消息计数开始计算，范围 1–1000000。失败不会推进计数。"},
+  "max_samples": {"description": "每位群友保留的最新语料条数", "type": "int", "default": 300, "hint": "范围 10–1000；累计条数不受语料滚动清理影响。"},
+  "max_message_chars": {"description": "每条语料最多保存的字符数", "type": "int", "default": 500, "hint": "范围 20–2000，超出部分截断。"},
+  "analysis_chars": {"description": "单次人格分析的语料字符预算", "type": "int", "default": 40000, "hint": "范围 2000–200000；从最近消息开始选取完整消息。"},
+  "min_message_chars": {"description": "计为有效消息的最少文字字符数", "type": "int", "default": 2, "hint": "范围 1–100；纯图片、语音、转发及引用中的文字不计入。"},
+  "provider_id": {"description": "人格生成和摘要使用的聊天模型提供商ID", "type": "string", "default": "", "hint": "填写 AstrBot 已配置的提供商ID；留空跟随消息所属会话的聊天模型。"},
+  "summary_every": {"description": "模仿期间每多少轮提取一次要点", "type": "int", "default": 6, "hint": "范围 1–20，不能大于 context_turns；暂停或切换时会提前提取剩余记录。"},
+  "context_turns": {"description": "模仿会话携带的最近完整对话轮数", "type": "int", "default": 20, "hint": "范围 2–50；更早内容通过事实摘要衔接。新会话只从原会话最近这些轮次提取事实。"},
+  "summary_chars": {"description": "每次事实摘要的字符上限", "type": "int", "default": 1600, "hint": "范围 200–4000；模型须用中性语言提取内容，不保留口头禅或人设指令。"},
+  "timeout": {"description": "每次人格或摘要模型调用的超时秒数", "type": "int", "default": 90, "hint": "范围 5–300；失败保留原人格版本和未摘要记录。"},
+  "sync_personas": {"description": "同步生成的人格到 AstrBot 人格库", "type": "bool", "default": false, "hint": "开启后创建以 mockspeaker_ 开头的人格并自动更新。模仿由本插件按请求替换人格，不需要在群会话中切换全局人格。"},
+  "excluded_users": {"description": "排除采集及模仿的用户ID", "type": "list", "default": [], "hint": "对所有启用的群生效；加入后停止采集并禁止选择。删除旧数据可用 /模仿 删除。"},
+  "command_prefixes": {"description": "不作为语料的命令前缀", "type": "list", "default": ["/"], "hint": "按实际机器人命令前缀补充，例如 !；本插件命令始终不作为语料。"}
+}
