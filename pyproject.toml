@@ -1,6 +1,6 @@
 [project]
 name = "astrbot-plugin-mockspeaker"
-version = "1.0.0"
+version = "1.1.0"
 description = "AstrBot group member style imitation with isolated conversation history"
 requires-python = ">=3.12"
 

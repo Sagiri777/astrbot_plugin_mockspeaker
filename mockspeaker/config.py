@@ -16,6 +16,7 @@ class Settings:
     summary_chars: int = 1600
     timeout: int = 90
     sync_personas: bool = False
+    cross_group_profiles: bool = False
     excluded_users: tuple[str, ...] = ()
     command_prefixes: tuple[str, ...] = ("/",)
 
@@ -44,9 +45,22 @@ class Settings:
             values[key] = tuple(str(x).strip() for x in config.get(key, getattr(defaults, key)) if str(x).strip())
         values["provider_id"] = str(config.get("provider_id", "")).strip()
         values["sync_personas"] = bool(config.get("sync_personas", False))
+        values["cross_group_profiles"] = bool(config.get("cross_group_profiles", False))
         if values["summary_every"] > values["context_turns"]:
             raise ValueError("summary_every 不能大于 context_turns")
         return cls(**values)
 
     def allows(self, platform: str, group: str) -> bool:
         return bool(group) and (group in self.allowed_groups or f"{platform}:{group}" in self.allowed_groups)
+
+    def groups_for(self, platform: str) -> tuple[str, ...]:
+        prefix = platform + ":"
+        return tuple(
+            sorted(
+                {
+                    entry[len(prefix) :] if entry.startswith(prefix) else entry
+                    for entry in self.allowed_groups
+                    if ":" not in entry or entry.startswith(prefix)
+                }
+            )
+        )

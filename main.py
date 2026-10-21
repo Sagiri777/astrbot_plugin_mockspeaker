@@ -114,9 +114,12 @@ class MockSpeakerPlugin(Star):
             if page < 1:
                 raise ValueError("页码必须大于零。")
             members = [
-                m for m in self.store.members(self._scope(event)) if m["user_id"] not in self.settings.excluded_users
+                m
+                for m in self.service.profile_members(self._scope(event))
+                if m["user_id"] not in self.settings.excluded_users
             ]
-            lines = [f"群友人格（第 {page} 页；每页20人；门槛 {self.settings.min_messages} 条）"]
+            mode = "跨群合并" if self.settings.cross_group_profiles else "本群"
+            lines = [f"群友人格（第 {page} 页；每页20人；{mode}门槛 {self.settings.min_messages} 条）"]
             for member in members[(page - 1) * 20 : page * 20]:
                 state = (
                     "可模仿" if member["prompt"] and member["total"] >= self.settings.min_messages else "积累中/生成中"
@@ -171,7 +174,7 @@ class MockSpeakerPlugin(Star):
                 selected = self.store.selected(scope, str(event.get_sender_id()))
                 yield event.plain_result(f"你当前的模仿对象：{selected or '未开启，使用原人格'}。")
                 return
-            member = self.store.member(scope, target)
+            member = self.service.profile_member(scope, target)
             if not member or target in self.settings.excluded_users:
                 raise ValueError("该群友暂无可用采集记录。")
             remaining = max(
@@ -186,6 +189,7 @@ class MockSpeakerPlugin(Star):
             yield event.plain_result(
                 f"{member['name']} ({target})：有效消息 {member['total']} 条；"
                 f"人格已覆盖 {member['generated_at_count']} 条；距更新 {remaining} 条。"
+                + (" 计数范围：同一平台实例的已启用群合计。" if self.settings.cross_group_profiles else "")
                 + (f" 上次生成失败：{member['error']}；五分钟后收到新消息重试。" if member["error"] else "")
             )
         except ValueError as exc:
@@ -210,9 +214,9 @@ class MockSpeakerPlugin(Star):
             scope = self._scope(event)
             if target in self.settings.excluded_users:
                 raise ValueError("该用户已被排除采集。")
-            if (scope, target) in self.service.jobs:
+            if self.service.profile_job_key(scope, target) in self.service.jobs:
                 raise ValueError("该人格正在生成，请稍后查看状态。")
-            member = self.store.member(scope, target)
+            member = self.service.profile_member(scope, target)
             if not member or member["total"] < self.settings.min_messages:
                 raise ValueError(f"有效消息数不足 {self.settings.min_messages} 条。")
             self.service.schedule_profile(scope, target, event.unified_msg_origin, force=True)
@@ -233,17 +237,18 @@ class MockSpeakerPlugin(Star):
         task = self.service.cancel_profile(scope, target)
         if task:
             await asyncio.gather(task, return_exceptions=True)
-        self.store.forget(scope, target)
+        shared_keys = self.store.forget(scope, target)
         if self.settings.sync_personas:
-            pid = "mockspeaker_" + hashlib.sha256(f"{scope}:{target}".encode()).hexdigest()[:24]
-            try:
-                await self.context.persona_manager.get_persona(pid)
-            except ValueError:
-                pass
-            else:
-                await self.context.persona_manager.delete_persona(pid)
+            for profile_scope in [scope, *shared_keys]:
+                pid = "mockspeaker_" + hashlib.sha256(f"{profile_scope}:{target}".encode()).hexdigest()[:24]
+                try:
+                    await self.context.persona_manager.get_persona(pid)
+                except ValueError:
+                    pass
+                else:
+                    await self.context.persona_manager.delete_persona(pid)
         yield event.plain_result(
-            "已删除该用户在本群的采集、人格和相关隔离记录，并取消相关选择。已有事实摘要不回溯删除。后续消息会重新采集；要停采请配置 excluded_users。"
+            "已删除该用户在本群的采集、人格和相关隔离记录，并取消本群相关选择；使用这些语料的合并人格已失效。已有事实摘要不回溯删除。后续消息会重新采集；要停采请配置 excluded_users。"
         )
 
     async def _deliver_notes(self, event, req):
@@ -353,13 +358,13 @@ class MockSpeakerPlugin(Star):
 
     @filter.llm_tool(name="mockspeaker_list")
     async def tool_list(self, event: AstrMessageEvent) -> str:
-        """列出当前群中可模仿的群友及其用户ID，不跨群查询。"""
+        """列出本群已采集的可模仿群友及其用户ID；人格可按配置合并其他已启用群的语料。"""
         if not self._enabled(event):
             return "当前群未启用 MockSpeaker。"
         return json.dumps(
             [
                 {"user_id": m["user_id"], "name": m["name"], "messages": m["total"]}
-                for m in self.store.members(self._scope(event))
+                for m in self.service.profile_members(self._scope(event))
                 if m["prompt"]
                 and m["total"] >= self.settings.min_messages
                 and m["user_id"] not in self.settings.excluded_users

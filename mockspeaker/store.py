@@ -25,6 +25,11 @@ class Store:
             message_id TEXT, text TEXT NOT NULL,
             UNIQUE(scope, message_id));
         CREATE INDEX IF NOT EXISTS samples_member ON samples(scope, user_id, id);
+        CREATE TABLE IF NOT EXISTS shared_profiles (
+            profile_key TEXT NOT NULL, user_id TEXT NOT NULL, source_scopes TEXT NOT NULL,
+            prompt TEXT NOT NULL DEFAULT '', generated_at_count INTEGER NOT NULL DEFAULT 0,
+            updated_at REAL, error TEXT NOT NULL DEFAULT '', retry_at REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY(profile_key, user_id));
         CREATE TABLE IF NOT EXISTS selections (
             scope TEXT, owner TEXT, target TEXT NOT NULL, PRIMARY KEY(scope, owner));
         CREATE TABLE IF NOT EXISTS sessions (
@@ -39,7 +44,7 @@ class Store:
         CREATE INDEX IF NOT EXISTS turns_session ON turns(session_id, id);
         CREATE TABLE IF NOT EXISTS notes (
             id TEXT PRIMARY KEY, origin TEXT NOT NULL, cid TEXT NOT NULL, text TEXT NOT NULL);
-        PRAGMA user_version=1;
+        PRAGMA user_version=2;
         """)
 
     def close(self):
@@ -80,6 +85,37 @@ class Store:
             r[0]
             for r in self.db.execute("SELECT text FROM samples WHERE scope=? AND user_id=? ORDER BY id", (scope, user))
         ]
+
+    def total_messages(self, scopes, user):
+        if not scopes:
+            return 0
+        placeholders = ",".join("?" for _ in scopes)
+        return self.db.execute(
+            f"SELECT COALESCE(SUM(total),0) FROM members WHERE scope IN ({placeholders}) AND user_id=?",
+            (*scopes, user),
+        ).fetchone()[0]
+
+    def shared_profile(self, key, user):
+        row = self.db.execute("SELECT * FROM shared_profiles WHERE profile_key=? AND user_id=?", (key, user)).fetchone()
+        return dict(row) if row else None
+
+    def save_shared_profile(self, key, user, sources, prompt, count):
+        with self.db:
+            self.db.execute(
+                """INSERT INTO shared_profiles(profile_key,user_id,source_scopes,prompt,generated_at_count,updated_at)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(profile_key,user_id) DO UPDATE SET
+                prompt=excluded.prompt,generated_at_count=excluded.generated_at_count,
+                updated_at=excluded.updated_at,error='',retry_at=0""",
+                (key, user, json.dumps(sources), prompt, count, time.time()),
+            )
+
+    def shared_profile_error(self, key, user, sources, message):
+        with self.db:
+            self.db.execute(
+                """INSERT INTO shared_profiles(profile_key,user_id,source_scopes,error,retry_at) VALUES(?,?,?,?,?)
+                ON CONFLICT(profile_key,user_id) DO UPDATE SET error=excluded.error,retry_at=excluded.retry_at""",
+                (key, user, json.dumps(sources), message[:300], time.time() + 300),
+            )
 
     def save_profile(self, scope, user, prompt, count):
         with self.db:
@@ -180,7 +216,15 @@ class Store:
 
     def forget(self, scope, user):
         """Erase samples, profile, selections, raw imitation turns and undelivered notes."""
+        shared_keys = [
+            row[0]
+            for row in self.db.execute("SELECT profile_key,source_scopes FROM shared_profiles WHERE user_id=?", (user,))
+            if scope in json.loads(row[1])
+        ]
         with self.db:
+            self.db.executemany(
+                "DELETE FROM shared_profiles WHERE profile_key=? AND user_id=?", [(key, user) for key in shared_keys]
+            )
             ids = [
                 r[0]
                 for r in self.db.execute(
@@ -194,6 +238,7 @@ class Store:
             self.db.execute("DELETE FROM selections WHERE scope=? AND (owner=? OR target=?)", (scope, user, user))
             self.db.execute("DELETE FROM samples WHERE scope=? AND user_id=?", (scope, user))
             self.db.execute("DELETE FROM members WHERE scope=? AND user_id=?", (scope, user))
+        return shared_keys
 
 
 def scope_key(platform, group):

@@ -1,8 +1,11 @@
 import asyncio
+import json
 import logging
 import time
+from itertools import zip_longest
 
 from .prompts import PROFILE_SYSTEM, SUMMARY_SYSTEM, profile_input, summary_input
+from .store import scope_key
 
 log = logging.getLogger(__name__)
 
@@ -17,8 +20,68 @@ class MockSpeakerService:
         self.summary_locks = {}
         self.profile_slots = asyncio.Semaphore(2)
 
-    def ready_profile(self, scope, target):
+    def profile_sources(self, scope):
+        if not self.settings.cross_group_profiles:
+            return (scope,)
+        platform, _ = json.loads(scope)
+        return tuple(scope_key(platform, group) for group in self.settings.groups_for(platform))
+
+    def profile_key(self, scope):
+        if not self.settings.cross_group_profiles:
+            return scope
+        return json.dumps(["cross_group", self.profile_sources(scope)], ensure_ascii=False, separators=(",", ":"))
+
+    def profile_job_key(self, scope, target):
+        return self.profile_key(scope), target
+
+    def profile_member(self, scope, target):
         member = self.store.member(scope, target)
+        if not member or not self.settings.cross_group_profiles:
+            return member
+        # A target must have been observed in this group, even when analysis is shared.
+        if scope not in self.profile_sources(scope):
+            return None
+        saved = self.store.shared_profile(self.profile_key(scope), target)
+        member.update(prompt="", generated_at_count=0, updated_at=None, error="", retry_at=0)
+        if saved:
+            member.update(saved)
+        member["total"] = self.store.total_messages(self.profile_sources(scope), target)
+        return member
+
+    def profile_members(self, scope):
+        members = [self.profile_member(scope, member["user_id"]) for member in self.store.members(scope)]
+        return sorted(
+            (member for member in members if member), key=lambda member: (-member["total"], member["user_id"])
+        )
+
+    def profile_samples(self, scope, target):
+        if not self.settings.cross_group_profiles:
+            samples, size = [], 0
+            for text in reversed(self.store.samples(scope, target)):
+                if size + len(text) > self.settings.analysis_chars:
+                    break
+                samples.append(text)
+                size += len(text)
+            return samples[::-1]
+        # Interleave groups so an active group cannot crowd out quieter groups.
+        streams = [
+            [(source, text) for text in reversed(self.store.samples(source, target))]
+            for source in self.profile_sources(scope)
+        ]
+        samples, size = [], 0
+        for batch in zip_longest(*streams):
+            for item in batch:
+                if item is None:
+                    continue
+                source, text = item
+                if size + len(text) > self.settings.analysis_chars:
+                    continue
+                samples.append({"group_id": json.loads(source)[1], "text": text})
+                size += len(text)
+        return samples
+
+    def ready_profile(self, scope, target):
+        member = self.profile_member(scope, target)
         if target in self.settings.excluded_users:
             raise ValueError("该用户已被排除采集和模仿。")
         if not member or member["total"] < self.settings.min_messages:
@@ -36,8 +99,8 @@ class MockSpeakerService:
         )
 
     def schedule_profile(self, scope, target, origin, force=False):
-        key = (scope, target)
-        member = self.store.member(scope, target)
+        key = self.profile_job_key(scope, target)
+        member = self.profile_member(scope, target)
         if key in self.jobs or not member:
             return False
         if not force and (not self.due(member) or member["retry_at"] > time.time()):
@@ -63,7 +126,7 @@ class MockSpeakerService:
     async def refresh_profile(self, scope, target, origin, force=False):
         """Snapshot the count before generation; messages arriving meanwhile stay dirty."""
         while True:
-            member = self.store.member(scope, target)
+            member = self.profile_member(scope, target)
             if not member or target in self.settings.excluded_users:
                 return
             if member["total"] < self.settings.min_messages:
@@ -72,23 +135,28 @@ class MockSpeakerService:
                 return
             count = member["total"]
             try:
-                samples, size = [], 0
-                for text in reversed(self.store.samples(scope, target)):
-                    if size + len(text) > self.settings.analysis_chars:
-                        break
-                    samples.append(text)
-                    size += len(text)
+                samples = self.profile_samples(scope, target)
                 async with self.profile_slots:
-                    prompt = await self.call(origin, profile_input(member["name"], samples[::-1]), PROFILE_SYSTEM)
-                if not self.store.member(scope, target):
+                    prompt = await self.call(origin, profile_input(member["name"], samples), PROFILE_SYSTEM)
+                if not self.profile_member(scope, target):
                     return
                 if len(prompt) > 12000:
                     raise ValueError("人格过长，请更换生成模型后重试")
                 if self.settings.sync_personas and self.sync_persona:
-                    await self.sync_persona(scope, target, prompt)
-                self.store.save_profile(scope, target, prompt, count)
+                    await self.sync_persona(self.profile_key(scope), target, prompt)
+                if self.settings.cross_group_profiles:
+                    self.store.save_shared_profile(
+                        self.profile_key(scope), target, self.profile_sources(scope), prompt, count
+                    )
+                else:
+                    self.store.save_profile(scope, target, prompt, count)
             except Exception as exc:
-                self.store.profile_error(scope, target, type(exc).__name__)
+                if self.settings.cross_group_profiles:
+                    self.store.shared_profile_error(
+                        self.profile_key(scope), target, self.profile_sources(scope), type(exc).__name__
+                    )
+                else:
+                    self.store.profile_error(scope, target, type(exc).__name__)
                 raise
             force = False
 
@@ -177,7 +245,7 @@ class MockSpeakerService:
         return ok
 
     def cancel_profile(self, scope, target):
-        task = self.jobs.pop((scope, target), None)
+        task = self.jobs.pop(self.profile_job_key(scope, target), None)
         if task:
             task.cancel()
         return task

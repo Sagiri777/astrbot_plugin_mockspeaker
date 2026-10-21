@@ -5,6 +5,7 @@ runner assembly, and core history saving. Only the model is replaced; no IM conn
 """
 
 import asyncio
+import hashlib
 import importlib.util
 import json
 import os
@@ -44,13 +45,13 @@ async def verify():
     names = {tool.name for tool in llm_tools.func_list}
     assert {"mockspeaker_list", "mockspeaker_get_prompt", "mockspeaker_select", "mockspeaker_pause"} <= names
 
-    def event():
+    def event(group="100", sender="alice"):
         message = AstrBotMessage()
-        message.type, message.self_id, message.group_id = MessageType.GROUP_MESSAGE, "bot", "100"
-        message.sender = MessageMember("alice", "Alice")
+        message.type, message.self_id, message.group_id = MessageType.GROUP_MESSAGE, "bot", group
+        message.sender = MessageMember(sender, sender.title())
         message.message, message.message_id = [Plain("周五见面")], "test-message"
         message.message_str = "周五见面"
-        return AstrMessageEvent(message.message_str, message, PlatformMetadata("test", "test", "qq1"), "100")
+        return AstrMessageEvent(message.message_str, message, PlatformMetadata("test", "test", "qq1"), group)
 
     await db_helper.initialize()
     cm = ConversationManager(db_helper)
@@ -109,8 +110,54 @@ async def verify():
             json.loads((await cm.get_conversation(restored.unified_msg_origin, cid)).history), ensure_ascii=False
         )
         assert "周五19点" in history and "老铁" not in history
+
+        # Reload against existing collection: the second group completes the shared threshold.
+        await plugin.terminate()
+        plugin = module.MockSpeakerPlugin(
+            context,
+            {
+                "allowed_groups": ["100", "200"],
+                "cross_group_profiles": True,
+                "min_messages": 2,
+                "provider_id": "fake",
+                "sync_personas": True,
+            },
+        )
+        await plugin.collect_messages(event(group="200", sender="bob"))
+        await asyncio.gather(*plugin.service.jobs.values())
+        second = event(group="200")
+        second_scope = plugin._scope(second)
+        merged = plugin.service.ready_profile(scope, "bob")
+        assert merged["total"] == merged["generated_at_count"] == 2
+        assert plugin.service.ready_profile(second_scope, "bob")["prompt"] == merged["prompt"]
+        assert plugin.store.member(scope, "bob")["total"] == 1
+        assert json.loads(await plugin.tool_list(second))[0]["messages"] == 2
+        shared_key = plugin.service.profile_key(scope)
+        persona_id = "mockspeaker_" + hashlib.sha256(f"{shared_key}:bob".encode()).hexdigest()[:24]
+        assert merged["prompt"] in (await personas.get_persona(persona_id)).system_prompt
+        cid_second = await cm.new_conversation(second.unified_msg_origin, content=[])
+        await plugin._select(second, "bob")
+        merged_request = ProviderRequest(
+            prompt=second.message_str,
+            conversation=await cm.get_conversation(second.unified_msg_origin, cid_second),
+            system_prompt="原人格",
+        )
+        await plugin.prepare_request(second, merged_request)
+        assert not second.is_stopped() and merged_request.conversation is None
+        assert merged["prompt"] in merged_request.system_prompt
+        assert plugin.store.selected(scope, "alice") is None
+        assert [reply async for reply in plugin.forget_command(event(group="200", sender="bob"))]
+        assert plugin.store.shared_profile(shared_key, "bob") is None
+        assert plugin.store.member(scope, "bob")["total"] == 1
+        try:
+            await personas.get_persona(persona_id)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Deleting a source group must remove the exported shared persona")
         print(
-            f"AstrBot {astrbot.__version__}: registration, persona sync, runner assembly, history isolation and summary restoration passed"
+            f"AstrBot {astrbot.__version__}: registration, persona sync, runner assembly, history isolation, "
+            "summary restoration and cross-group profiles passed"
         )
     finally:
         await plugin.terminate()
